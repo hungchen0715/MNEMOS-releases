@@ -1,0 +1,213 @@
+name: Build and publish MNEMOS
+
+# Builds the Windows, Mac and iPhone apps from the private hungchen0715/MNEMOS repo and publishes
+# them here. Runs in this public repo because public repos get free build minutes.
+#
+# - Every 30 minutes it checks whether MNEMOS `main` changed any app code since the last release;
+#   if so it builds and publishes. Installed apps then update themselves.
+# - "Run workflow" (Actions tab) builds right away; tick "force" to build even without changes.
+#
+# Secrets in this repo:
+#   SOURCE_TOKEN               read-only token for hungchen0715/MNEMOS (Contents: Read)
+#   TAURI_SIGNING_PRIVATE_KEY  Windows update signing key
+#   MAC_UPDATE_SIGNING_KEY     Mac update signing key (Ed25519, PEM)
+# Publishing uses this repo's own GITHUB_TOKEN.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "MNEMOS branch or commit to build"
+        default: main
+      force:
+        description: "Build even if nothing changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: hungchen0715/MNEMOS
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.c.outputs.build }}
+      sha: ${{ steps.c.outputs.sha }}
+      version: ${{ steps.c.outputs.version }}
+      buildnum: ${{ steps.c.outputs.buildnum }}
+    steps:
+      - id: c
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          REF: ${{ inputs.ref || 'main' }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          SHA=$(gh api "repos/$SOURCE_REPO/commits/$REF" --jq .sha)
+          BASE=$(gh api "repos/$SOURCE_REPO/contents/VERSION?ref=$SHA" --jq .content | base64 -d | tr -d '[:space:]')
+          # The last release says which commit it was built from ("Source: <sha>").
+          LAST_TAG=$(GH_TOKEN=${{ github.token }} gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          LAST_SHA=$(GH_TOKEN=${{ github.token }} gh release view --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null | sed -n 's/^Source: \([0-9a-f]\{7,40\}\).*/\1/p' | head -1 || true)
+          LAST_BUILD=$(curl -sfL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/apple.json" | jq -r '.build // empty' || true)
+
+          BUILD=false
+          if [ "$FORCE" = "true" ] || [ -z "$LAST_SHA" ]; then
+            BUILD=true
+          elif [ "$LAST_SHA" != "$SHA" ]; then
+            # Only app changes need a new release.
+            CHANGED=$(gh api "repos/$SOURCE_REPO/compare/$LAST_SHA...$SHA" --jq '[.files[].filename] | map(select(test("^(ios|windows|web|scripts|assets|VERSION)"))) | length')
+            [ "$CHANGED" -gt 0 ] && BUILD=true
+          fi
+
+          # Versions only go up, so installed apps always see the new one as an update.
+          LAST=${LAST_TAG#v}
+          if [[ "$LAST" == "$BASE".* ]]; then PATCH=$(( ${LAST##*.} + 1 )); else PATCH=0; fi
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$BASE.$PATCH" >> "$GITHUB_OUTPUT"
+          echo "buildnum=$(( ${LAST_BUILD:-100} + 1 ))" >> "$GITHUB_OUTPUT"
+          echo "MNEMOS $SHA, last release $LAST_TAG from ${LAST_SHA:-?}: build=$BUILD → $BASE.$PATCH"
+
+  windows:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/windows/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/windows/src-tauri -> target
+      - name: Set version
+        working-directory: src
+        run: node scripts/release/set-version.mjs ${{ needs.check.outputs.version }}
+      - name: Add whisper.cpp (speech-to-text without Python)
+        shell: bash
+        env:
+          # Pinned build of ggml-org/whisper.cpp; the checksum is checked before anything is bundled.
+          WHISPER_CPP_RELEASE: b5454
+          WHISPER_CPP_SHA256: 6ba69e3482d7826214f90a6a9c84ca07782aec1e1d0c6a7c30c994fd5d816ccb
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$WHISPER_CPP_RELEASE" --repo ggml-org/whisper.cpp -p whisper-bin-x64.zip -D "$RUNNER_TEMP"
+          echo "$WHISPER_CPP_SHA256  $RUNNER_TEMP/whisper-bin-x64.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/whisper-bin-x64.zip" -d "$RUNNER_TEMP/whisper"
+          mkdir -p src/windows/src-tauri/whisper
+          cp "$RUNNER_TEMP"/whisper/Release/{whisper-cli.exe,whisper.dll,ggml.dll,ggml-base.dll} src/windows/src-tauri/whisper/
+          cp "$RUNNER_TEMP"/whisper/Release/ggml-cpu-*.dll src/windows/src-tauri/whisper/
+      - name: Build the installer (signed for the updater)
+        working-directory: src/windows
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri build --bundles nsis --config src-tauri/tauri.release.conf.json
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir dist
+          EXE=$(ls src/windows/src-tauri/target/release/bundle/nsis/*.exe | head -1)
+          cp "$EXE" dist/MNEMOS-Windows-Setup.exe
+          cp "$EXE.sig" dist/MNEMOS-Windows-Setup.exe.sig
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          retention-days: 3
+
+  apple:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+      - name: Generate the Xcode project
+        working-directory: src/ios
+        run: |
+          which xcodegen || brew install xcodegen
+          xcodegen generate
+      - name: Build the iPhone app (unsigned, for SideStore)
+        working-directory: src/ios
+        run: |
+          xcodebuild build -project MNEMOS.xcodeproj -scheme MNEMOS -configuration Release \
+            -sdk iphoneos -derivedDataPath build -quiet \
+            MARKETING_VERSION=${{ needs.check.outputs.version }} \
+            CURRENT_PROJECT_VERSION=${{ needs.check.outputs.buildnum }} \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+          mkdir -p Payload ../../dist
+          cp -r build/Build/Products/Release-iphoneos/MNEMOS.app Payload/
+          zip -qr ../../dist/MNEMOS.ipa Payload
+      - name: Build the Mac app (Intel + Apple Silicon)
+        working-directory: src/ios
+        run: |
+          xcodebuild build -project MNEMOS.xcodeproj -scheme MNEMOS-Mac -configuration Release \
+            -destination 'generic/platform=macOS' -derivedDataPath build -quiet \
+            MARKETING_VERSION=${{ needs.check.outputs.version }} \
+            CURRENT_PROJECT_VERSION=${{ needs.check.outputs.buildnum }} \
+            ONLY_ACTIVE_ARCH=NO CODE_SIGN_IDENTITY="-"
+          ditto -c -k --keepParent build/Build/Products/Release/MNEMOS.app ../../dist/MNEMOS-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apple
+          path: dist/*
+          retention-days: 3
+
+  publish:
+    needs: [check, windows, apple]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          fetch-depth: 30
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write the update feeds
+        env:
+          MAC_UPDATE_SIGNING_KEY: ${{ secrets.MAC_UPDATE_SIGNING_KEY }}
+        run: |
+          cp src/assets/brand/mnemos-icon-1024.png dist/icon.png
+          export RELEASE_NOTES="$(git -C src log -5 --pretty='- %s' -- ios windows web/src/lib VERSION)"
+          node src/scripts/release/make-feeds.mjs dist ${{ needs.check.outputs.version }} ${{ needs.check.outputs.buildnum }} "$GITHUB_REPOSITORY"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=${{ needs.check.outputs.version }}
+          { git -C src log -5 --pretty='- %s' -- ios windows web/src/lib VERSION; echo; echo "Source: ${{ needs.check.outputs.sha }}"; } > notes.md
+          gh release create "v$V" --repo "$GITHUB_REPOSITORY" --title "MNEMOS $V" --notes-file notes.md --latest \
+            dist/MNEMOS-Windows-Setup.exe dist/MNEMOS-Windows-Setup.exe.sig \
+            dist/MNEMOS-mac.zip dist/MNEMOS.ipa dist/icon.png \
+            dist/latest.json dist/apple.json dist/sidestore.json
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/v$V"
