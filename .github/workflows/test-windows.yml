@@ -1,0 +1,47 @@
+name: Test Windows app
+
+# Tests the Windows app the way a coworker's PC runs it: no Python, an older release installed
+# first, then updated to a newer one; a spoken recording must come back as text.
+# (Every build also runs this test before it publishes; see build.yml.)
+on:
+  workflow_dispatch:
+    inputs:
+      old:
+        description: "Release installed first (what coworkers have)"
+        default: v0.7.6
+      new:
+        description: "Release to update to (latest = newest)"
+        default: latest
+      ref:
+        description: "MNEMOS branch with the test script"
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hungchen0715/MNEMOS
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          sparse-checkout: scripts/e2e
+      - name: Download the installers
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OLD: ${{ inputs.old }}
+          NEW: ${{ inputs.new }}
+        run: |
+          gh release download "$OLD" --repo "$GITHUB_REPOSITORY" -p MNEMOS-Windows-Setup.exe -D old
+          if [ "$NEW" = latest ]; then NEW=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName); fi
+          gh release download "$NEW" --repo "$GITHUB_REPOSITORY" -p MNEMOS-Windows-Setup.exe -D new
+          echo "$OLD -> $NEW"
+      - name: Install, update, transcribe
+        shell: pwsh
+        run: src/scripts/e2e/windows-update-stt.ps1 -OldInstaller old/MNEMOS-Windows-Setup.exe -NewInstaller new/MNEMOS-Windows-Setup.exe
