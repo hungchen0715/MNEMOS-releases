@@ -10,17 +10,75 @@ on:
         description: "Release installed first (what coworkers have)"
         default: v0.7.6
       new:
-        description: "Release to update to (latest = newest)"
-        default: latest
+        description: "Update to: a release tag, latest, or build (builds the MNEMOS branch below, not published)"
+        default: build
       ref:
-        description: "MNEMOS branch with the test script"
+        description: "MNEMOS branch (test script, and the app when new = build)"
         default: main
 
 permissions:
   contents: read
 
 jobs:
+  build:
+    if: inputs.new == 'build'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hungchen0715/MNEMOS
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/windows/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/windows/src-tauri -> target
+      # A version above every release, so the app doesn't "update" itself back to a release.
+      - name: Set version
+        working-directory: src
+        run: node scripts/release/set-version.mjs 9.9.9
+      - name: Add whisper.cpp
+        shell: bash
+        env:
+          WHISPER_CPP_RELEASE: b5454
+          WHISPER_CPP_SHA256: 6ba69e3482d7826214f90a6a9c84ca07782aec1e1d0c6a7c30c994fd5d816ccb
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$WHISPER_CPP_RELEASE" --repo ggml-org/whisper.cpp -p whisper-bin-x64.zip -D "$RUNNER_TEMP"
+          echo "$WHISPER_CPP_SHA256  $RUNNER_TEMP/whisper-bin-x64.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/whisper-bin-x64.zip" -d "$RUNNER_TEMP/whisper"
+          mkdir -p src/windows/src-tauri/whisper
+          cp "$RUNNER_TEMP"/whisper/Release/{whisper-cli.exe,whisper.dll,ggml.dll,ggml-base.dll} src/windows/src-tauri/whisper/
+          cp "$RUNNER_TEMP"/whisper/Release/ggml-cpu-*.dll src/windows/src-tauri/whisper/
+      - name: Build the installer
+        working-directory: src/windows
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri build --bundles nsis --config src-tauri/tauri.release.conf.json
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir dist
+          cp "$(ls src/windows/src-tauri/target/release/bundle/nsis/*.exe | head -1)" dist/MNEMOS-Windows-Setup.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-test
+          path: dist/*
+          retention-days: 3
+
   test:
+    needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -31,6 +89,11 @@ jobs:
           token: ${{ secrets.SOURCE_TOKEN }}
           path: src
           sparse-checkout: scripts/e2e
+      - if: inputs.new == 'build'
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-test
+          path: new
       - name: Download the installers
         shell: bash
         env:
@@ -40,7 +103,7 @@ jobs:
         run: |
           gh release download "$OLD" --repo "$GITHUB_REPOSITORY" -p MNEMOS-Windows-Setup.exe -D old
           if [ "$NEW" = latest ]; then NEW=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName); fi
-          gh release download "$NEW" --repo "$GITHUB_REPOSITORY" -p MNEMOS-Windows-Setup.exe -D new
+          if [ "$NEW" != build ]; then gh release download "$NEW" --repo "$GITHUB_REPOSITORY" -p MNEMOS-Windows-Setup.exe -D new; fi
           echo "$OLD -> $NEW"
       - name: Install, update, transcribe
         shell: pwsh
