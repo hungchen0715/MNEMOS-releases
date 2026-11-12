@@ -178,8 +178,37 @@ jobs:
           path: dist/*
           retention-days: 3
 
+  # Nothing is published unless the new Windows app, installed over the current release on a
+  # PC without Python, turns a spoken recording into text.
+  test-windows:
+    needs: [check, windows]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          sparse-checkout: scripts/e2e
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: new
+      - name: Download the current release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p old
+          gh release download --repo "$GITHUB_REPOSITORY" -p MNEMOS-Windows-Setup.exe -D old || cp new/MNEMOS-Windows-Setup.exe old/
+      - name: Install, update, transcribe
+        shell: pwsh
+        run: src/scripts/e2e/windows-update-stt.ps1 -OldInstaller old/MNEMOS-Windows-Setup.exe -NewInstaller new/MNEMOS-Windows-Setup.exe
+
   publish:
-    needs: [check, windows, apple]
+    needs: [check, windows, apple, test-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
