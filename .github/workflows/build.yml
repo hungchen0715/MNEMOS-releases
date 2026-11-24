@@ -110,7 +110,8 @@ jobs:
         if: steps.whisper-cache.outputs.cache-hit != 'true'
         uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
-          vulkan-sdk-version: latest
+          vulkan-query-version: latest
+          vulkan-use-cache: true
       - name: Build whisper.cpp with Vulkan GPU + CPU fallback
         if: steps.whisper-cache.outputs.cache-hit != 'true'
         shell: bash
