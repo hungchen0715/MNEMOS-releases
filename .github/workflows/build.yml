@@ -105,14 +105,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: src/windows/src-tauri/whisper
-          key: whisper-cpp-vulkan-v1.9.6-win-x64-v1
-      - name: Set up Vulkan SDK
+          key: whisper-cpp-vulkan-v1.9.6-win-x64-v2
+      - name: Install LunarG Vulkan SDK (prebuilt, includes glslc)
         if: steps.whisper-cache.outputs.cache-hit != 'true'
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
-        with:
-          vulkan-query-version: latest
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, shaderc
-          vulkan-use-cache: true
+        shell: bash
+        run: |
+          curl -fL -o "$RUNNER_TEMP/vulkan-sdk.exe" https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe
+          "$RUNNER_TEMP/vulkan-sdk.exe" --root "C:/VulkanSDK" --accept-licenses --default-answer --confirm-command install
+          echo "VULKAN_SDK=C:/VulkanSDK" >> "$GITHUB_ENV"
+          echo "C:/VulkanSDK/Bin" >> "$GITHUB_PATH"
+          ls -la C:/VulkanSDK/Bin/glslc.exe
       - name: Build whisper.cpp with Vulkan GPU + CPU fallback
         if: steps.whisper-cache.outputs.cache-hit != 'true'
         shell: bash
@@ -134,6 +136,18 @@ jobs:
           ls -la src/windows/src-tauri/whisper
           test -f src/windows/src-tauri/whisper/whisper-cli.exe
           test -f src/windows/src-tauri/whisper/ggml-vulkan.dll
+      - name: Add llama.cpp Vulkan runtime (built-in offline LG EXAONE without Ollama)
+        shell: bash
+        env:
+          LLAMA_CPP_RELEASE: b12681
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$LLAMA_CPP_RELEASE" --repo ggml-org/llama.cpp -p "llama-${LLAMA_CPP_RELEASE}-bin-win-vulkan-x64.zip" -D "$RUNNER_TEMP"
+          unzip -q "$RUNNER_TEMP/llama-${LLAMA_CPP_RELEASE}-bin-win-vulkan-x64.zip" -d "$RUNNER_TEMP/llama"
+          mkdir -p src/windows/src-tauri/llama
+          find "$RUNNER_TEMP/llama" -type f \( -name 'llama-server.exe' -o -name '*.dll' \) -exec cp -v {} src/windows/src-tauri/llama/ \;
+          ls -la src/windows/src-tauri/llama
+          test -f src/windows/src-tauri/llama/llama-server.exe
       - name: Build the installer (signed for the updater)
         working-directory: src/windows
         env:
