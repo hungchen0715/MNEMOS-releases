@@ -100,20 +100,38 @@ jobs:
       - name: Set version
         working-directory: src
         run: node scripts/release/set-version.mjs ${{ needs.check.outputs.version }}
-      - name: Add whisper.cpp (speech-to-text without Python)
+      - name: Cache whisper.cpp (Vulkan GPU + CPU backends)
+        id: whisper-cache
+        uses: actions/cache@v4
+        with:
+          path: src/windows/src-tauri/whisper
+          key: whisper-cpp-vulkan-v1.9.6-win-x64-v1
+      - name: Set up Vulkan SDK
+        if: steps.whisper-cache.outputs.cache-hit != 'true'
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-sdk-version: latest
+      - name: Build whisper.cpp with Vulkan GPU + CPU fallback
+        if: steps.whisper-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
-          # Pinned build of ggml-org/whisper.cpp; the checksum is checked before anything is bundled.
-          WHISPER_CPP_RELEASE: b5454
-          WHISPER_CPP_SHA256: 6ba69e3482d7826214f90a6a9c84ca07782aec1e1d0c6a7c30c994fd5d816ccb
-          GH_TOKEN: ${{ github.token }}
+          WHISPER_CPP_TAG: v1.9.6
         run: |
-          gh release download "$WHISPER_CPP_RELEASE" --repo ggml-org/whisper.cpp -p whisper-bin-x64.zip -D "$RUNNER_TEMP"
-          echo "$WHISPER_CPP_SHA256  $RUNNER_TEMP/whisper-bin-x64.zip" | sha256sum -c -
-          unzip -q "$RUNNER_TEMP/whisper-bin-x64.zip" -d "$RUNNER_TEMP/whisper"
+          git clone --depth 1 --branch "$WHISPER_CPP_TAG" https://github.com/ggml-org/whisper.cpp.git "$RUNNER_TEMP/whisper-src"
+          cmake -S "$RUNNER_TEMP/whisper-src" -B "$RUNNER_TEMP/whisper-build" \
+            -G "Visual Studio 17 2022" -A x64 \
+            -DGGML_VULKAN=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DBUILD_SHARED_LIBS=ON
+          cmake --build "$RUNNER_TEMP/whisper-build" --config Release --target whisper-cli --parallel
           mkdir -p src/windows/src-tauri/whisper
-          cp "$RUNNER_TEMP"/whisper/Release/{whisper-cli.exe,whisper.dll,ggml.dll,ggml-base.dll} src/windows/src-tauri/whisper/
-          cp "$RUNNER_TEMP"/whisper/Release/ggml-cpu-*.dll src/windows/src-tauri/whisper/
+          find "$RUNNER_TEMP/whisper-build" -path '*/Release/*' \( -name 'whisper-cli.exe' -o -name 'whisper.dll' -o -name 'ggml*.dll' \) -exec cp -v {} src/windows/src-tauri/whisper/ \;
+          ls -la src/windows/src-tauri/whisper
+          test -f src/windows/src-tauri/whisper/whisper-cli.exe
+          test -f src/windows/src-tauri/whisper/ggml-vulkan.dll
       - name: Build the installer (signed for the updater)
         working-directory: src/windows
         env:
