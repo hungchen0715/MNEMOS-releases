@@ -111,6 +111,7 @@ jobs:
         uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-query-version: latest
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, shaderc
           vulkan-use-cache: true
       - name: Build whisper.cpp with Vulkan GPU + CPU fallback
         if: steps.whisper-cache.outputs.cache-hit != 'true'
